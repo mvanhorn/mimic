@@ -83,7 +83,7 @@ defmodule Mimic do
   ```
   """
   alias ExUnit.Callbacks
-  alias Mimic.{Server, VerificationError}
+  alias Mimic.{Coordinator, Server, VerificationError}
 
   @doc false
   defmacro __using__(_opts \\ []) do
@@ -312,12 +312,16 @@ defmodule Mimic do
 
     * `module` - the copied module.
     * `owner_pid` - the process ID of the process which created the stub.
-    * `allowed_pid` - the process ID of the process which should also be allowed
-      to use this stub.
+    * `allowed_via` - the process which should also be allowed to use this stub.
+      It can be a pid, a registered name (anything `GenServer.whereis/1` accepts,
+      resolved immediately), or a zero-arity function to resolve allowed pids
+      lazily at time of invocation. If a function is provided, it must return a
+      pid, `nil`, or a list of those.
 
   ## Raises:
 
     * If Mimic is running in global mode.
+    * If a registered name does not resolve to a local pid.
 
   Allows other processes to share expectations and stubs defined by another
   process.
@@ -338,12 +342,52 @@ defmodule Mimic do
     |> Task.await
   end
   ```
+
+  ## Lazy (deferred) allowances
+
+  If the process you want to allow doesn't exist yet at the time you set up
+  expectations, you can pass a function instead of a pid. Until it returns the
+  caller, the function is called on mock invocations from processes that are not
+  otherwise allowed. Every pid it returns then becomes a regular allowance, kept
+  until the owner is cleaned up, so the function is not called again for it.
+
+  ```elixir
+  test "allows a process that starts later" do
+    Calculator
+    |> expect(:add, fn x, y -> x + y end)
+    |> allow(self(), fn -> GenServer.whereis(MyServer) end)
+
+    start_supervised!(MyServer)
+    # MyServer can now call Calculator.add and hit the expectation
+  end
+  ```
   """
-  @spec allow(module(), pid(), pid()) :: module() | {:error, atom()}
-  def allow(module, owner_pid, allowed_pid) do
+  @spec allow(module(), pid(), pid() | GenServer.name() | (-> pid() | [pid() | nil] | nil)) ::
+          module() | {:error, atom()}
+  def allow(module, owner_pid, allowed_via)
+
+  def allow(module, owner_pid, fun) when is_function(fun, 0) do
     module
-    |> Server.allow(owner_pid, allowed_pid)
+    |> Server.allow_lazy(owner_pid, fun)
     |> validate_server_response(:allow)
+  end
+
+  def allow(module, owner_pid, allowed_pid) when is_pid(allowed_pid) do
+    module
+    |> Coordinator.allow(owner_pid, allowed_pid)
+    |> validate_server_response(:allow)
+  end
+
+  def allow(module, owner_pid, name) do
+    case GenServer.whereis(name) do
+      pid when is_pid(pid) ->
+        allow(module, owner_pid, pid)
+
+      _ ->
+        raise ArgumentError,
+              "cannot allow #{inspect(name)} to use #{inspect(module)} because it does not " <>
+                "resolve to a local pid. Use a function to allow a process that starts later."
+    end
   end
 
   @doc """
@@ -366,11 +410,11 @@ defmodule Mimic do
   def copy(module, opts \\ []) do
     with :ok <- ensure_module_not_copied(module),
          {:module, module} <- Code.ensure_compiled(module),
-         :ok <- Mimic.Server.mark_to_copy(module, opts) do
+         :ok <- Coordinator.mark_to_copy(module, opts) do
       if repeat_until_failure?() do
-        ExUnit.after_suite(fn _ -> Mimic.Server.soft_reset(module) end)
+        Coordinator.register_soft_reset()
       else
-        ExUnit.after_suite(fn _ -> Mimic.Server.reset(module) end)
+        ExUnit.after_suite(fn _ -> Coordinator.reset(module) end)
       end
 
       :ok
@@ -378,12 +422,8 @@ defmodule Mimic do
       {:error, {:module_already_copied, _module}} ->
         :ok
 
-      {:error, reason}
-      when reason in [:embedded, :badfile, :nofile, :on_load_failure, :unavailable] ->
+      {:error, _reason} ->
         raise ArgumentError, "Module #{inspect(module)} is not available"
-
-      error ->
-        validate_server_response(error, :copy)
     end
   end
 
@@ -452,7 +492,7 @@ defmodule Mimic do
   ```
   """
   @spec set_mimic_private(map()) :: :ok
-  def set_mimic_private(_context \\ %{}), do: Server.set_private_mode()
+  def set_mimic_private(_context \\ %{}), do: Coordinator.set_private_mode()
 
   @doc """
   Sets the mode to global. Mocks can be set and used by all processes
@@ -460,6 +500,9 @@ defmodule Mimic do
   ```elixir
   setup :set_mimic_global
   ```
+
+  Must be called from the test process, since global mode is released by an
+  `ExUnit.Callbacks.on_exit/2` callback. Raises otherwise.
   """
   @spec set_mimic_global(map()) :: :ok
   def set_mimic_global(_context \\ %{})
@@ -469,7 +512,25 @@ defmodule Mimic do
             "If you want to use Mimic in global mode, remove \"async: true\" when using ExUnit.Case"
   end
 
-  def set_mimic_global(_context), do: Server.set_global_mode(self())
+  def set_mimic_global(_context) do
+    owner = self()
+    # Registered before the mode is taken, so a raise here leaves the mode alone.
+    # Releasing is a compare-and-swap, so a callback that outlives the mode is a no-op.
+    release_global_owner_on_exit(owner)
+    :ok = Coordinator.set_global_mode(owner)
+  end
+
+  defp release_global_owner_on_exit(owner) do
+    Callbacks.on_exit({Mimic, :global_mode}, fn ->
+      Coordinator.release_global_owner(owner)
+    end)
+  rescue
+    ArgumentError ->
+      reraise "Mimic cannot be set to global mode outside of a test process. " <>
+                "Global mode is released by an on_exit callback, which only the test " <>
+                "process can register, so it would never be handed back.",
+              __STACKTRACE__
+  end
 
   @doc """
   Chooses the mode based on ExUnit context. If `async` is `true` then
@@ -514,7 +575,7 @@ defmodule Mimic do
   @doc "Returns the current mode (`:global` or `:private`)"
   @spec mode() :: :private | :global
   def mode do
-    Server.get_mode()
+    Coordinator.get_mode()
   end
 
   @doc """
@@ -583,21 +644,16 @@ defmodule Mimic do
       [[1, 2]]
 
   """
-  @spec calls(module, atom, non_neg_integer) :: [[any]] | {:error, :atom}
+  @spec calls(module, atom, non_neg_integer) :: [[any]]
   def calls(module, function_name, arity) do
     raise_if_not_exported_function!(module, function_name, arity)
 
-    result =
-      Server.get_calls(module, function_name, arity)
-      |> validate_server_response(:calls)
-
-    with {:ok, calls} <- result do
-      calls
-    end
+    Server.get_calls(module, function_name, arity)
+    |> validate_server_response(:calls)
   end
 
   defp ensure_module_not_copied(module) do
-    case Server.marked_to_copy?(module) do
+    case Coordinator.marked_to_copy?(module) do
       false -> :ok
       true -> {:error, {:module_already_copied, module}}
     end
@@ -655,10 +711,5 @@ defmodule Mimic do
   defp validate_server_response({:error, {:module_not_copied, module}}, _action) do
     raise ArgumentError,
           "Module #{inspect(module)} has not been copied. See docs for Mimic.copy/1"
-  end
-
-  defp validate_server_response(_, :copy) do
-    raise ArgumentError,
-          "Failed to copy module. See docs for Mimic.copy/1"
   end
 end

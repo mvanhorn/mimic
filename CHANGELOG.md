@@ -1,3 +1,32 @@
+# 2.4.2 (2026-09-18)
+
+* fix: release global mode when the test that set it finishes. It was handed back
+  asynchronously with nothing waiting on it, so under load a later test could find
+  a finished test's pid still holding it and fail with "Expect cannot be called by
+  the current process. Only the global owner is allowed."
+* **breaking**: `set_mimic_global/1` now raises when called outside a test process.
+  Global mode is released by an `on_exit` callback, which only the test process can
+  register, so such a call took a mode that was never handed back and left the rest
+  of the suite stuck in global mode. Call it from the test process (or a `setup`
+  block) instead.
+
+# 2.4.1 (2026-09-12)
+
+* fix: memory leak from incorrect ETS select clause by @bencoppock in #123
+* chore: enable ExDoc markdown documentation by @BobbieBarker in #122
+
+# 2.4.0 (2026-08-22)
+
+* perf: shard `Mimic.Server` into one partition per scheduler (routed by owner
+  pid) so concurrent async tests no longer serialize through a single process
+
+# 2.3.1 (2026-08-07)
+
+* fix: verify_on_exit! cleans up even when it raises by @grantwest in #117
+* fix: improve owner lookup performance by @whatyouhide in #118
+* docs: fix reject documentation wording by @yosinn1-blip in #114
+* docs: fix reference to allow/3 by @ftes in #113
+
 # 2.3.0 (2026-01-17)
 
 * fix: namespace auto setup verify_on_exit! by @PragTob in #111
